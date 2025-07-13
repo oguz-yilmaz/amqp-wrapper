@@ -1,10 +1,9 @@
 package messaging
 
 import (
+	"errors"
 	"fmt"
 	"sync"
-
-	"errors"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
