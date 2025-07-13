@@ -1,4 +1,4 @@
-package messaging
+package amqpwraper
 
 import (
 	"errors"

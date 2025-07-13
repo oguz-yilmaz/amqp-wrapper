@@ -1,4 +1,4 @@
-package messaging
+package amqpwraper
 
 type EventHandler = func(event *BaseEvent) error
 

@@ -1,4 +1,4 @@
-package messaging
+package amqpwraper
 
 type Producer interface {
 	Publish(event Event) error
