@@ -88,17 +88,21 @@ type Broker struct {
 	Conn        *Connection // represents the current connection
 	Exchanges   []*Exchange
 	Queues      map[string]*Queue
-	m           sync.Mutex
+	m           sync.RWMutex
 }
 
 func NewBroker() *Broker {
 	return &Broker{
 		Connections: []*Connection{},
 		Conn:        nil,
+		Queues:      make(map[string]*Queue),
 	}
 }
 
 func (b *Broker) GetConnection(name string) *Connection {
+	b.m.RLock()
+	defer b.m.RUnlock()
+
 	for _, c := range b.Connections {
 		if name == c.ConnectionName {
 			return c
@@ -119,6 +123,9 @@ func (b *Broker) HasConnection(url string) bool {
 }
 
 func (b *Broker) GetActiveChannel() *amqp.Channel {
+	b.m.RLock()
+	defer b.m.RUnlock()
+
 	for _, c := range b.Conn.Channels {
 		if !c.IsClosed() {
 			return c
@@ -244,6 +251,9 @@ func (b *Broker) ExchangeDeclare(ex Exchange) (*amqp.Channel, error) {
 }
 
 func (b *Broker) GetQueue(name string) *Queue {
+	b.m.RLock()
+	defer b.m.RUnlock()
+
 	if b.Queues == nil {
 		return nil
 	}
