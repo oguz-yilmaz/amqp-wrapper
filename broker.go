@@ -13,14 +13,6 @@ import (
 // - Add TLS
 // - Add Quorum Queues
 
-const (
-	amqpURL     = "amqp://guest:guest@localhost:5672/"
-	exchange    = "my.direct"
-	exchangeTyp = "direct"
-	queue       = "my.queue"
-	routingKey  = "my.key"
-)
-
 type ExchangeType string
 
 const (

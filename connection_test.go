@@ -4,62 +4,29 @@ import (
 	"testing"
 	"time"
 
-	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/stretchr/testify/assert"
 )
 
-func TestNewConnectionConfigDefaults(t *testing.T) {
-	conf := NewConnectionConfig()
+func TestNewConnectionConfig_Defaults(t *testing.T) {
+	name := "test-conn"
+	conf := NewConnectionConfig(name)
 
-	assert.Equal(t, "amqp://guest:guest@localhost:5672/", conf.AMQPUrl)
-	assert.Equal(t, "default_connection", conf.ConnectionName)
+	assert.Equal(t, name, conf.ConnectionName)
 	assert.Equal(t, "en_US", conf.Locale)
-	assert.Equal(t, 10*time.Second, conf.Hearbeat)
+	assert.Equal(t, 10*time.Second, conf.Heartbeat)
 }
 
-func TestConnectionDial_NewConnection(t *testing.T) {
-	conn := &Connection{
-		AMQPUrl:        "amqp://guest:guest@localhost:5672/",
-		ConnectionName: "test_connection",
-		Heartbeat:      5 * time.Second,
+func TestNewConnection_Creation(t *testing.T) {
+	conf := &ConnectionConfig{
+		ConnectionName: "conn1",
 		Locale:         "en_US",
+		Heartbeat:      5 * time.Second,
 	}
 
-	amqpConn, err := conn.Dial()
-	assert.NoError(t, err)
-	assert.NotNil(t, amqpConn)
-	assert.False(t, conn.IsClosed())
-}
+	conn := NewConnection(conf, nil)
 
-func TestConnectionDial_ReusesConnection(t *testing.T) {
-	conn := &Connection{
-		AMQPUrl:        "amqp://guest:guest@localhost:5672/",
-		ConnectionName: "test_connection",
-		Heartbeat:      5 * time.Second,
-		Locale:         "en_US",
-	}
-
-	// First dial
-	firstConn, err1 := conn.Dial()
-	assert.NoError(t, err1)
-
-	// Second dial (should reuse)
-	secondConn, err2 := conn.Dial()
-	assert.NoError(t, err2)
-
-	assert.Equal(t, firstConn, secondConn)
-	assert.False(t, conn.IsClosed())
-}
-
-func TestConnection_IsClosed_NilConn(t *testing.T) {
-	conn := &Connection{}
-	assert.True(t, conn.IsClosed())
-}
-
-func TestConnection_HasChannel(t *testing.T) {
-	conn := &Connection{}
-	assert.False(t, conn.HasChannel())
-
-	conn.Channels = append(conn.Channels, &amqp.Channel{})
-	assert.True(t, conn.HasChannel())
+	assert.Equal(t, conf.ConnectionName, conn.ConnectionName)
+	assert.Equal(t, conf.Locale, conn.Locale)
+	assert.Equal(t, conf.Heartbeat, conn.Heartbeat)
+	assert.Nil(t, conn.AMQPConn)
 }
