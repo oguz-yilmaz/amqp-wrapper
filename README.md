@@ -49,6 +49,12 @@ Use `Broker.InitMessaging` to:
 
 ---
 
+Make sure to run RabbitMQ before testing examples:
+
+```bash
+docker run -it --rm --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3.13-management
+```
+
 ### Example 1: Minimal setup with `direct` exchange
 
 This example shows the simple setup: a `direct` exchange, a durable queue,
@@ -99,9 +105,18 @@ func main() {
         log.Fatalf("InitMessaging failed: %v", err)
     }
 
+    // Publish a message
     err = client.Publish(amqp.Publishing{
         ContentType: "text/plain",
-        Body:        []byte("New Order Created"),
+        Body:        []byte("New Order Created 1"),
+    }, amqpwrapper.PublishOptions{
+        Key: "order.created",
+    })
+
+    // Publish another message
+    err = client.Publish(amqp.Publishing{
+        ContentType: "text/plain",
+        Body:        []byte("New Order Created 2"),
     }, amqpwrapper.PublishOptions{
         Key: "order.created",
     })
@@ -116,13 +131,23 @@ func main() {
         log.Fatalf("Consume failed: %v", err)
     }
 
-    select {
-    case msg := <-msgs:
-        fmt.Printf("Received: %s\n", string(msg.Body))
-    case <-time.After(2 * time.Second):
-        log.Println("No message received")
+    // Consume messages
+    for {
+        select {
+        case msg := <-msgs:
+            fmt.Printf("Received: %s\n", string(msg.Body))
+        case <-time.After(2 * time.Second):
+            return
+        }
     }
 }
+```
+
+When you run this, the output will look like:
+```bash
+$ go run cmd/main.go
+Received: New Order Created 1
+Received: New Order Created 2
 ```
 
 ---
