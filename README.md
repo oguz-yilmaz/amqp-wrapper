@@ -40,10 +40,20 @@ This library is designed to be minimal, declarative, and high-level.
 Use `Broker.InitMessaging` to:
 
 - Dial (or reuse) a connection
+- Handle channel management
+- Handle automatic reconnections
 - Declare the exchange
 - Declare the queue
 - Bind them
 - Return a ready-to-use `Client` for publish/consume
+
+---
+
+### Example 1: Minimal setup with `direct` exchange
+
+This example shows the simple setup: a `direct` exchange, a durable queue,
+and a single routing key (`order.created`). It publishes and consumes a message
+using the high-level `Client` API.
 
 ```go
 package main
@@ -89,7 +99,6 @@ func main() {
         log.Fatalf("InitMessaging failed: %v", err)
     }
 
-    // Publish a message
     err = client.Publish(amqp.Publishing{
         ContentType: "text/plain",
         Body:        []byte("New Order Created"),
@@ -100,7 +109,6 @@ func main() {
         log.Fatalf("Publish failed: %v", err)
     }
 
-    // Consume the message
     msgs, err := client.Consume(amqpwrapper.ConsumeOptions{
         AutoAck: true,
     })
@@ -113,6 +121,100 @@ func main() {
         fmt.Printf("Received: %s\n", string(msg.Body))
     case <-time.After(2 * time.Second):
         log.Println("No message received")
+    }
+}
+```
+
+---
+
+### Example 2: Topic exchange with multiple routing keys
+
+This example demonstrates a more realistic use case with a `topic` exchange. It
+binds the queue to multiple routing keys (`user.created`, `user.updated`,
+`user.*.email`) and listens for matching messages.
+
+```go
+package main
+
+import (
+    "fmt"
+    "log"
+    "time"
+
+    amqpwrapper "github.com/oguz-yilmaz/amqp-wrapper"
+    amqp "github.com/rabbitmq/amqp091-go"
+)
+
+func main() {
+    b := amqpwrapper.NewBroker(amqpwrapper.BrokerConfig{
+        AMQPUrl:    "amqp://guest:guest@localhost:5672",
+        MaxChannel: 10,
+    })
+
+    ex := amqpwrapper.Exchange{
+        Name:    "users.topic",
+        Type:    amqpwrapper.TOPIC,
+        Durable: true,
+    }
+
+    q := amqpwrapper.QueueConfig{
+        Name:    "user.events",
+        Durable: true,
+    }
+
+    bindings := []amqpwrapper.QueueBinding{
+        {BindingKey: "user.created"},
+        {BindingKey: "user.updated"},
+        {BindingKey: "user.*.email"},
+    }
+
+    client, err := b.InitMessaging("user-connection", amqpwrapper.QueueSetup{
+        QueueConfig: q,
+        Exchange:    ex,
+        Bindings:    bindings,
+    })
+    if err != nil {
+        log.Fatalf("InitMessaging failed: %v", err)
+    }
+
+    // Simulate publishing three different types of events
+    events := []struct {
+        Key string
+        Msg string
+    }{
+        {"user.created", "User was created"},
+        {"user.updated", "User profile updated"},
+        {"user.admin.email", "Admin email updated"},
+    }
+
+    for _, e := range events {
+        err := client.Publish(amqp.Publishing{
+            ContentType: "text/plain",
+            Body:        []byte(e.Msg),
+        }, amqpwrapper.PublishOptions{Key: e.Key})
+        if err != nil {
+            log.Fatalf("Publish failed for key %s: %v", e.Key, err)
+        }
+    }
+
+    msgs, err := client.Consume(amqpwrapper.ConsumeOptions{
+        AutoAck: true,
+    })
+    if err != nil {
+        log.Fatalf("Consume failed: %v", err)
+    }
+
+    timeout := time.After(2 * time.Second)
+    received := 0
+    for received < 3 {
+        select {
+        case msg := <-msgs:
+            fmt.Printf("Received: %s\n", string(msg.Body))
+            received++
+        case <-timeout:
+            log.Println("Timeout waiting for all messages")
+            return
+        }
     }
 }
 ```
