@@ -83,152 +83,150 @@ func NewQueue(conf QueueConfig) *Queue {
 	}
 }
 
+type BrokerConfig struct {
+	AMQPUrl    string
+	MaxChannel int
+}
+
 type Broker struct {
-	Connections []*Connection
-	Conn        *Connection // represents the current connection
-	Exchanges   []*Exchange
-	Queues      map[string]*Queue
-	m           sync.RWMutex
+	AMQPUrl  string
+	Clients  map[string]*Client // key: ex:<exchange_name>|queue:<queue_name>
+	channels []*amqp.Channel
+	conn     *Connection
+	m        sync.RWMutex
+	BrokerConfig
 }
 
-func NewBroker() *Broker {
+func NewBroker(config BrokerConfig) *Broker {
+	maxChannel := config.MaxChannel
+	if maxChannel <= 0 {
+		maxChannel = 10
+	}
+
 	return &Broker{
-		Connections: []*Connection{},
-		Conn:        nil,
-		Queues:      make(map[string]*Queue),
+		AMQPUrl:  config.AMQPUrl,
+		Clients:  make(map[string]*Client),
+		channels: make([]*amqp.Channel, 0),
+		m:        sync.RWMutex{},
+		BrokerConfig: BrokerConfig{
+			MaxChannel: maxChannel,
+		},
 	}
 }
 
-func (b *Broker) GetConnection(name string) *Connection {
+func (b *Broker) addChannel() *amqp.Channel {
+	if !b.hasExistingAMQPConnection() {
+		return nil
+	}
+
+	ch, err := b.conn.AMQPConn.Channel()
+	if err != nil {
+		// You might want to log this
+		return nil
+	}
+
+	b.channels = append(b.channels, ch)
+	return ch
+}
+
+func (b *Broker) getUsableChannel() *amqp.Channel {
 	b.m.RLock()
-	defer b.m.RUnlock()
+	for _, ch := range b.channels {
+		if ch != nil && !ch.IsClosed() {
+			b.m.RUnlock()
+			return ch
+		}
+	}
+	b.m.RUnlock()
 
-	for _, c := range b.Connections {
-		if name == c.ConnectionName {
-			return c
+	b.cleanClosedChannels()
+
+	return b.addChannel()
+}
+
+func (b *Broker) cleanClosedChannels() {
+	activeChannels := make([]*amqp.Channel, 0, len(b.channels))
+	for _, ch := range b.channels {
+		if ch != nil && !ch.IsClosed() {
+			activeChannels = append(activeChannels, ch)
 		}
 	}
 
-	return nil
+	b.channels = activeChannels
 }
 
-func (b *Broker) HasConnection(url string) bool {
-	for _, v := range b.Connections {
-		if url == v.AMQPUrl {
-			return true
-		}
-	}
-
-	return false
-}
-
-func (b *Broker) GetActiveChannel() *amqp.Channel {
-	b.m.RLock()
-	defer b.m.RUnlock()
-
-	for _, c := range b.Conn.Channels {
-		if !c.IsClosed() {
-			return c
-		}
-	}
-
-	return nil
-}
-
-func (b *Broker) NewConnection(conf *ConnectionConfig) (*Connection, error) {
-	if conf.AMQPUrl == "" {
-		return nil, errors.New("AMQP url must be provided")
-	}
-
-	b.m.Lock()
-	defer b.m.Unlock()
-
-	if b.HasConnection(conf.AMQPUrl) {
-		return nil, errors.New("connection with that url already exists")
-	}
-
-	c := &Connection{
-		AMQPUrl:        conf.AMQPUrl,
-		ConnectionName: conf.ConnectionName,
-		Heartbeat:      conf.Hearbeat,
-		Locale:         conf.Locale,
-		Channels:       []*amqp.Channel{},
-	}
-
-	b.Connections = append(b.Connections, c)
-
-	return c, nil
-}
-
-func (b *Broker) GetExchange(name string) *Exchange {
-	for _, ex := range b.Exchanges {
-		if ex.Name == name {
-			return ex
-		}
-	}
-
-	return nil
-}
-
-//   - A single queue can be bound to multiple exchanges
-//   - An exchange can be bound to multiple queues
-//
 // # Creates new connection
 //
 // Reuses if the same connection name passed
 func (b *Broker) Dial(
 	amqpUrl string,
 	connectionName string,
-) error {
+	client *Client,
+) (*Client, error) {
 	if amqpUrl == "" {
-		return errors.New("AMQP URL must be provided")
+		return nil, errors.New("AMQP URL must be provided")
 	}
+	conf := NewConnectionConfig(connectionName)
 
-	conf := NewConnectionConfig()
-	conf.AMQPUrl = amqpUrl
-
-	if connectionName != "" {
-		conf.ConnectionName = connectionName
-	}
-
-	var conn *Connection
-	cExist := b.GetConnection(conf.ConnectionName)
-	if cExist != nil {
-		conn = cExist
-	} else {
-		cNew, err := b.NewConnection(conf)
-		if err != nil {
-			return fmt.Errorf("new connection error: %w", err)
-		}
-
-		conn = cNew
-	}
-
-	amqpConn, err := conn.Dial() // reuses existing connection if available
+	conn, err := b.CreateConnection(conf, amqpUrl)
 	if err != nil {
-		return fmt.Errorf("dial error: %w", err)
+		return nil, fmt.Errorf("dial error: %w", err)
 	}
 
-	b.m.Lock()
-	defer b.m.Unlock()
+	b.addConnection(conn)
+	client.addConnection(conn)
 
-	conn.AMQPConn = amqpConn
-	b.Conn = conn // Set current connection for the Broker
+	return client, nil
+}
+
+func (b *Broker) addConnection(c *Connection) {
+	if b == nil {
+		panic("Broker is nil in addConnection")
+	}
+	if b.hasExistingAMQPConnection() {
+		return
+	}
+
+	b.conn = c
+}
+
+func (b *Broker) hasExistingAMQPConnection() bool {
+	if b != nil && b.conn != nil && b.conn.AMQPConn != nil && !b.conn.AMQPConn.IsClosed() {
+		return true
+	}
+
+	return false
+}
+
+func (b *Broker) GetAMQPConnection() *amqp.Connection {
+	if b.hasExistingAMQPConnection() {
+		return b.conn.AMQPConn
+	}
 
 	return nil
 }
 
-func (b *Broker) ExchangeDeclare(ex Exchange) (*amqp.Channel, error) {
-	if b.Conn.AMQPConn == nil {
-		return nil, errors.New("connection is not established")
+func (b *Broker) CreateConnection(conf *ConnectionConfig, amqpUrl string) (*Connection, error) {
+	if b.hasExistingAMQPConnection() {
+		return b.conn, nil
 	}
 
-	ch, err := b.Conn.AMQPConn.Channel()
+	cn, err := amqp.DialConfig(amqpUrl, amqp.Config{
+		Properties: amqp.Table{"connection_name": conf.ConnectionName},
+		Heartbeat:  conf.Heartbeat,
+		Locale:     conf.Locale,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("channel error: %w", err)
+		return nil, err
 	}
 
-	err = ch.ExchangeDeclare(
+	return NewConnection(conf, cn), nil
+}
+
+func (b *Broker) ExchangeDeclare(ex Exchange, c *Client) (*amqp.Channel, error) {
+	ch := b.getUsableChannel()
+
+	err := ch.ExchangeDeclare(
 		ex.Name,
 		string(ex.Type),
 		ex.Durable,
@@ -242,62 +240,37 @@ func (b *Broker) ExchangeDeclare(ex Exchange) (*amqp.Channel, error) {
 	}
 
 	b.m.Lock()
-	defer b.m.Unlock()
-
-	b.Conn.Channels = append(b.Conn.Channels, ch)
-	b.Exchanges = append(b.Exchanges, &ex)
+	c.exchange = &ex
+	b.m.Unlock()
 
 	return ch, nil
 }
 
-func (b *Broker) GetQueue(name string) *Queue {
-	b.m.RLock()
-	defer b.m.RUnlock()
-
-	if b.Queues == nil {
-		return nil
+func (b *Broker) addClient(qName, exName string, c *Client) {
+	clientMapKey := fmt.Sprintf("ex:%s|queue:%s", exName, qName)
+	_, ok := b.Clients[clientMapKey]
+	if !ok {
+		b.Clients[clientMapKey] = c
 	}
-
-	queue, exists := b.Queues[name]
-	if !exists {
-		return nil
-	}
-
-	return queue
 }
 
-func (b *Broker) QueueDeclare(qconf QueueConfig, qb QueueBinding, exName string) (*Queue, error) {
-	b.m.Lock()
-	defer b.m.Unlock()
-
+func (b *Broker) QueueDeclare(qconf QueueConfig, qb QueueBinding, exName string, c *Client) (*Queue, error) {
 	q := NewQueue(qconf)
 
-	// Get Connection
-	conn := b.Conn
+	conn := b.GetAMQPConnection()
 	if conn == nil || conn.IsClosed() {
 		return nil, fmt.Errorf("no active connection found")
 	}
 
-	// Get or create a Channel
-	var amqpChannel *amqp.Channel
-	existingChannel := b.GetActiveChannel()
-	if existingChannel == nil {
-		newChannel, err := b.Conn.AMQPConn.Channel()
-		if err != nil {
-			return nil, fmt.Errorf("channel error: %w", err)
-		}
+	b.addClient(qconf.Name, exName, c)
 
-		amqpChannel = newChannel
-		conn.Channels = append(conn.Channels, newChannel)
-	} else {
-		amqpChannel = existingChannel
-	}
+	ch := b.getUsableChannel()
 
 	// Create a new Queue instance
 	var amqpQueue amqp.Queue
 	var err error
 	if !q.Passive {
-		amqpQueue, err = amqpChannel.QueueDeclare(
+		amqpQueue, err = ch.QueueDeclare(
 			q.Name,
 			q.Durable,
 			q.AutoDelete,
@@ -306,7 +279,7 @@ func (b *Broker) QueueDeclare(qconf QueueConfig, qb QueueBinding, exName string)
 			q.Args,
 		)
 	} else {
-		amqpQueue, err = amqpChannel.QueueDeclarePassive(
+		amqpQueue, err = ch.QueueDeclarePassive(
 			q.Name,
 			q.Durable,
 			q.AutoDelete,
@@ -319,106 +292,145 @@ func (b *Broker) QueueDeclare(qconf QueueConfig, qb QueueBinding, exName string)
 		return nil, fmt.Errorf("queue declare error: %w", err)
 	}
 
+	q.AMQPQueue = &amqpQueue
+
 	// Bind the queue to the exchange
-	err = amqpChannel.QueueBind(q.Name, qb.BindingKey, exName, qb.NoWait, qb.Args)
+	err = ch.QueueBind(q.Name, qb.BindingKey, exName, qb.NoWait, qb.Args)
 	if err != nil {
 		return nil, fmt.Errorf("queue bind error: %w", err)
 	}
 
-	// We will check if the queue already exists in the broker
-	existingQueue := b.GetQueue(q.Name)
-	if existingQueue == nil {
-		if b.Queues == nil {
-			b.Queues = make(map[string]*Queue)
+	Bind(q, c.exchange, &qb)
+
+	return q, nil
+}
+
+// Caller should ensure that this is called in a thread-safe manner
+func Bind(
+	q *Queue,
+	ex *Exchange,
+	b *QueueBinding,
+) {
+	if q == nil || ex == nil || b == nil || b.Queue != nil || b.Exchange != nil {
+		return
+	}
+
+	queueHasBinding := false
+	exchangeHasBinding := false
+
+	for _, existing := range q.Bindings {
+		if existing.BindingKey == b.BindingKey && existing.Exchange == ex {
+			queueHasBinding = true
+			break
 		}
-
-		b.Queues[q.Name] = q
-		existingQueue = q
-	} else {
-		UpdatePropertiesQueue(existingQueue, q)
 	}
 
-	existingQueue.AMQPQueue = &amqpQueue
-
-	exchange := b.GetExchange(exName)
-	if exchange == nil {
-		return nil, fmt.Errorf("exchange %s not found", exName)
+	for _, existing := range ex.Bindings {
+		if existing.BindingKey == b.BindingKey && existing.Queue == q {
+			exchangeHasBinding = true
+			break
+		}
 	}
 
-	qb.Queue = existingQueue
-	qb.Exchange = exchange
-	existingQueue.Bindings = append(existingQueue.Bindings, &qb)
-	exchange.Bindings = append(exchange.Bindings, &qb)
+	if queueHasBinding && exchangeHasBinding {
+		return
+	}
 
-	return existingQueue, nil
+	b.Queue = q
+	b.Exchange = ex
+
+	if !queueHasBinding {
+		q.Bindings = append(q.Bindings, b)
+	}
+	if !exchangeHasBinding {
+		ex.Bindings = append(ex.Bindings, b)
+	}
+}
+
+type QueueSetup struct {
+	Exchange    Exchange
+	QueueConfig QueueConfig
+	Bindings    []QueueBinding
 }
 
 func (b *Broker) InitMessaging(
-	brokerURL string,
 	connectionName string,
-	q QueueConfig,
-	qb QueueBinding,
-	ex Exchange,
-) (*amqp.Channel, *Queue, error) {
-	if ex.Name == "" {
-		return nil, nil, errors.New("exchange name must be provided")
+	setup QueueSetup,
+) (*Client, error) {
+	if setup.QueueConfig.Name == "" {
+		return nil, errors.New("queue name must be provided")
+	}
+	if setup.Exchange.Name == "" {
+		return nil, errors.New("exchange name must be provided")
 	}
 
-	if q.Name == "" {
-		return nil, nil, errors.New("queue name must be provided")
+	if b.AMQPUrl == "" {
+		return nil, errors.New("queue name must be provided")
 	}
 
-	err := b.Dial(brokerURL, connectionName)
+	client := NewClient(b.AMQPUrl)
+	client, err := b.Dial(b.AMQPUrl, connectionName, client)
 	if err != nil {
-		return nil, nil, fmt.Errorf("dial error: %w", err)
+		return nil, fmt.Errorf("dial error: %w", err)
 	}
 
-	ch, err := b.ExchangeDeclare(ex)
+	// Set client reference in the broker
+	b.m.Lock()
+	b.Clients[fmt.Sprintf("ex:%s|queue:%s", setup.Exchange.Name, setup.QueueConfig.Name)] = client
+	b.m.Unlock()
+
+	_, err = b.ExchangeDeclare(setup.Exchange, client)
 	if err != nil {
-		return nil, nil, fmt.Errorf("exchange declare error: %w", err)
+		return nil, fmt.Errorf("exchange declare error: %w", err)
 	}
 
-	rq, err := b.QueueDeclare(q, qb, ex.Name)
+	// Pick the first binding just to declare the queue
+	var baseBinding QueueBinding
+	if len(setup.Bindings) > 0 {
+		baseBinding = setup.Bindings[0]
+	} else {
+		return nil, fmt.Errorf("at least one binding must be provided")
+	}
+
+	rq, err := b.QueueDeclare(setup.QueueConfig, baseBinding, setup.Exchange.Name, client)
 	if err != nil {
-		return nil, nil, fmt.Errorf("queue declare error: %w", err)
+		return nil, fmt.Errorf("queue declare error: %w", err)
 	}
 
-	qb.Exchange = &ex
+	client.addQueue(rq)
 
-	return ch, rq, nil
+	// Bind all other keys (including the first one again if needed)
+	for _, binding := range setup.Bindings {
+		err = b.bindQueueToExchange(rq, &setup.Exchange, binding)
+		if err != nil {
+			return nil, fmt.Errorf("queue bind error for key '%s': %w", binding.BindingKey, err)
+		}
+	}
+
+	return client, nil
 }
 
-func UpdatePropertiesQueue(
+func (b *Broker) bindQueueToExchange(
 	q *Queue,
-	q2 *Queue,
-) {
-	if q2.Name != "" {
-		q.Name = q2.Name
+	ex *Exchange,
+	binding QueueBinding,
+) error {
+	ch := b.getUsableChannel()
+	if ch == nil {
+		return fmt.Errorf("no usable channel found")
 	}
-	if q2.Passive {
-		q.Passive = q2.Passive
+
+	err := ch.QueueBind(q.Name, binding.BindingKey, ex.Name, binding.NoWait, binding.Args)
+	if err != nil {
+		return err
 	}
-	if q2.Durable {
-		q.Durable = q2.Durable
+
+	// Maintain binding state in memory
+	bnd := &QueueBinding{
+		BindingKey: binding.BindingKey,
+		NoWait:     binding.NoWait,
+		Args:       binding.Args,
 	}
-	if q2.AutoDelete {
-		q.AutoDelete = q2.AutoDelete
-	}
-	if q2.Exclusive {
-		q.Exclusive = q2.Exclusive
-	}
-	if q2.NoWait {
-		q.NoWait = q2.NoWait
-	}
-	if q2.Args != nil {
-		if q.Args == nil {
-			q.Args = make(amqp.Table)
-		}
-		for k, v := range q2.Args {
-			q.Args[k] = v
-		}
-	}
-	if q2.AMQPQueue != nil {
-		q.AMQPQueue = q2.AMQPQueue
-	}
+	Bind(q, ex, bnd)
+	return nil
 }
