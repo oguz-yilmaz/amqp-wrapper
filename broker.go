@@ -86,6 +86,7 @@ type Broker struct {
 	channels []*amqp.Channel
 	conn     *Connection
 	m        sync.RWMutex
+	setup    *QueueSetup
 	BrokerConfig
 }
 
@@ -233,6 +234,7 @@ func (b *Broker) ExchangeDeclare(ex Exchange, c *Client) (*amqp.Channel, error) 
 
 	b.m.Lock()
 	c.exchange = &ex
+	c.addChannel(ch)
 	b.m.Unlock()
 
 	return ch, nil
@@ -368,13 +370,16 @@ func (b *Broker) InitMessaging(
 
 	// Set client reference in the broker
 	b.m.Lock()
+	b.setup = &setup
 	b.Clients[fmt.Sprintf("ex:%s|queue:%s", setup.Exchange.Name, setup.QueueConfig.Name)] = client
+	client.broker = b
 	b.m.Unlock()
 
-	_, err = b.ExchangeDeclare(setup.Exchange, client)
+	ch, err := b.ExchangeDeclare(setup.Exchange, client)
 	if err != nil {
 		return nil, fmt.Errorf("exchange declare error: %w", err)
 	}
+	client.changeChannel(ch)
 
 	// Pick the first binding just to declare the queue
 	var baseBinding QueueBinding

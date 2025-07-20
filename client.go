@@ -6,23 +6,10 @@ import (
 	"log"
 	"os"
 	"sync"
+	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
-
-// type Client interface {
-//     Publish(key string, msg amqp091.Publishing) error
-//     Consume(opts ConsumeOptions) (<-chan amqp091.Delivery, error)
-//     OnChannelClose(fn func(*Channel, error))
-//     OnConnectionClose(fn func(*Connection, error))
-//     Close() // closes both the connection and channels
-//     CloseChannel()
-//     CloseConnection()
-// }
-
-// Client.Publish(key string, mandatory bool, immediate bool, msg amqp091.Publishing)
-// Client.Publish(key string, msg amqp091.Publishing) -> WE WONT USE mandatory and immediate(deprecated)
-// Client.Consume(consumer string, autoAck bool, exclusive bool, noLocal bool, noWait bool, args amqp091.Table)
 
 type Client struct {
 	m *sync.Mutex
@@ -30,15 +17,17 @@ type Client struct {
 	infolog *log.Logger
 	errlog  *log.Logger
 
+	broker   *Broker
 	exchange *Exchange
 	conn     *Connection
 	channel  *amqp.Channel
 	queue    *Queue
 
-	done            chan bool
-	notifyConnClose chan *amqp.Error
-	notifyChanClose chan *amqp.Error
-	notifyConfirm   chan amqp.Confirmation
+	done              chan bool
+	notifyConnClose   chan *amqp.Error
+	notifyChanClose   chan *amqp.Error
+	notifyConfirm     chan amqp.Confirmation
+	notifyChannCancel chan string
 
 	isReady bool
 }
@@ -50,8 +39,31 @@ func NewClient(qName string) *Client {
 		errlog:  log.New(os.Stderr, "[ERROR] ", log.LstdFlags|log.Lmsgprefix),
 		done:    make(chan bool),
 	}
+	client.registerChannels()
+
 	go client.handleReconnect()
+
 	return &client
+}
+
+func (c *Client) handleReconnect() {
+	for {
+		select {
+		case err := <-c.notifyConnClose:
+			c.errlog.Printf("Connection closed: %v. Reconnecting...", err)
+			c.reconnect()
+		case err := <-c.notifyChanClose:
+			c.errlog.Printf("Channel closed: %v. Reinitializing channel...", err)
+			c.reconnect() // Optional: Separate channel reconnect logic
+		case <-c.done:
+			return
+		}
+	}
+}
+
+func (c *Client) addChannel(ch *amqp.Channel) {
+	c.channel = ch
+	c.registerChannels()
 }
 
 func (c *Client) addConnection(conn *Connection) {
@@ -62,18 +74,43 @@ func (c *Client) addQueue(q *Queue) {
 	c.queue = q
 }
 
-func (c *Client) addExchange(e *Exchange) {
-	c.exchange = e
-}
-
 func (c *Client) registerConnectionClose() {
-	// Create a new Go channel for Connection Close notifications
 	c.notifyConnClose = make(chan *amqp.Error, 1)
-	// If the connection to RabbitMQ is closed for any reason, send the error
-	// to this channel (notifyConnClose) so the client can handle it.
 	if c.conn != nil && c.conn.AMQPConn != nil {
 		c.conn.AMQPConn.NotifyClose(c.notifyConnClose)
 	}
+}
+
+func (c *Client) registerChannelClose() {
+	c.notifyChanClose = make(chan *amqp.Error, 1)
+	if c.conn != nil && c.conn.AMQPConn != nil {
+		c.channel.NotifyClose(c.notifyChanClose)
+	}
+}
+
+func (c *Client) registerPublishConfirm() {
+	c.notifyConfirm = make(chan amqp.Confirmation, 1)
+	if c.conn != nil && c.conn.AMQPConn != nil {
+		c.channel.NotifyPublish(c.notifyConfirm)
+	}
+}
+
+func (c *Client) registerChannelCancel() {
+	c.notifyChannCancel = make(chan string, 1)
+	if c.conn != nil && c.conn.AMQPConn != nil {
+		c.channel.NotifyCancel(c.notifyChannCancel)
+	}
+}
+
+func (c *Client) registerChannels() {
+	if c.conn == nil || c.conn.AMQPConn == nil {
+		return
+	}
+
+	c.registerConnectionClose()
+	c.registerChannelClose()
+	c.registerPublishConfirm()
+	c.registerChannelCancel()
 }
 
 func (c *Connection) IsClosed() bool {
@@ -85,6 +122,8 @@ func (c *Connection) IsClosed() bool {
 }
 
 func (c *Client) Close() {
+	close(c.done)
+
 	ch := c.channel
 	conn := c.conn
 
@@ -103,8 +142,36 @@ func (c *Client) Close() {
 	}
 }
 
-func (c *Client) handleReconnect() {
+func (c *Client) reconnect() {
+	c.m.Lock()
+	defer c.m.Unlock()
 
+	for {
+		c.errlog.Println("Attempting to reconnect...")
+
+		time.Sleep(5 * time.Second) // TODO: Add exponential backoff
+
+		if c.broker == nil || c.broker.setup == nil {
+			c.errlog.Println("Cannot reconnect: broker or setup not available")
+			continue
+		}
+
+		newClient, err := c.broker.InitMessaging(c.broker.AMQPUrl, *c.broker.setup)
+		if err != nil {
+			c.errlog.Printf("Reconnect failed: %v", err)
+			continue
+		}
+
+		// Reuse internal state
+		c.changeConnection(newClient.conn)
+		c.changeChannel(newClient.channel)
+		c.addQueue(newClient.queue)
+		c.exchange = newClient.exchange
+
+		c.registerChannels()
+		c.infolog.Println("Reconnected successfully")
+		return
+	}
 }
 
 func (client *Client) changeConnection(connection *Connection) {
@@ -113,9 +180,6 @@ func (client *Client) changeConnection(connection *Connection) {
 	conn := client.conn.AMQPConn
 
 	client.notifyConnClose = make(chan *amqp.Error, 1)
-
-	// If the connection to RabbitMQ is closed for any reason, send the error
-	// to this channel (notifyConnClose) so the client can handle it.
 	conn.NotifyClose(client.notifyConnClose)
 }
 
@@ -125,11 +189,7 @@ func (client *Client) changeChannel(channel *amqp.Channel) {
 	client.notifyChanClose = make(chan *amqp.Error, 1)
 	client.notifyConfirm = make(chan amqp.Confirmation, 1)
 
-	// If the channel is closed unexpectedly (e.g., RabbitMQ crashes, or your
-	// code misuses it), notify us
 	client.channel.NotifyClose(client.notifyChanClose)
-	// Notify us when the broker confirms that it has received and persisted a
-	// published message
 	client.channel.NotifyPublish(client.notifyConfirm)
 }
 
@@ -141,16 +201,12 @@ type PublishOptions struct {
 }
 
 func (c *Client) Publish(msg amqp.Publishing, opts PublishOptions) error {
-	if c.conn == nil {
-		return errors.New("no connection available")
+	if c.conn == nil || c.channel == nil || c.conn.IsClosed() || c.channel.IsClosed() {
+		go c.reconnect()
+		return errors.New("connection or channel not available")
 	}
 
-	ch, err := c.conn.AMQPConn.Channel()
-	if err != nil {
-		return fmt.Errorf("failed to create channel: %w", err)
-	}
-
-	return ch.Publish(
+	return c.channel.Publish(
 		c.exchange.Name,
 		opts.Key,
 		opts.Mandatory,
