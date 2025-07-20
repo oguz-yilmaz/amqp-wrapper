@@ -67,7 +67,7 @@ loop:
 				Key: "order.created",
 			})
 			if err != nil {
-				log.Println("Publish failed: %v", err)
+				log.Printf("Publish failed: %v\n", err)
 			} else {
 				fmt.Printf("Published: %s\n", msg)
 			}
