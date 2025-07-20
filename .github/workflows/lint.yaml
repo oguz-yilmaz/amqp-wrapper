@@ -26,4 +26,4 @@ jobs:
           version: latest
 
       - name: Run linter
-        run: golangci-lint run .
+        run: golangci-lint run *.go --timeout 5m
