@@ -31,8 +31,6 @@ type Client struct {
 
 	lastConsumeOpts *ConsumeOptions
 	consumerChan    chan amqp.Delivery
-
-	isReady bool
 }
 
 func NewClient(qName string) *Client {

@@ -40,4 +40,4 @@ jobs:
           done
 
       - name: Run tests
-        run: go test -v ./...
+        run: go test -v $(go list ./... | grep -v '/examples' | grep -v '/cmd')
