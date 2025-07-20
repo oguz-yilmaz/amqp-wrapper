@@ -29,6 +29,9 @@ type Client struct {
 	notifyConfirm     chan amqp.Confirmation
 	notifyChannCancel chan string
 
+	lastConsumeOpts *ConsumeOptions
+	consumerChan    chan amqp.Delivery
+
 	isReady bool
 }
 
@@ -148,8 +151,7 @@ func (c *Client) reconnect() {
 
 	for {
 		c.errlog.Println("Attempting to reconnect...")
-
-		time.Sleep(5 * time.Second) // TODO: Add exponential backoff
+		time.Sleep(5 * time.Second)
 
 		if c.broker == nil || c.broker.setup == nil {
 			c.errlog.Println("Cannot reconnect: broker or setup not available")
@@ -162,13 +164,44 @@ func (c *Client) reconnect() {
 			continue
 		}
 
-		// Reuse internal state
 		c.changeConnection(newClient.conn)
 		c.changeChannel(newClient.channel)
 		c.addQueue(newClient.queue)
 		c.exchange = newClient.exchange
-
 		c.registerChannels()
+
+		// Restart consumer if one existed
+		if c.lastConsumeOpts != nil {
+			if c.lastConsumeOpts.Qos > 0 {
+				_ = c.channel.Qos(c.lastConsumeOpts.Qos, 0, false)
+			}
+
+			deliveryStream, err := c.channel.Consume(
+				c.queue.Name,
+				c.lastConsumeOpts.Consumer,
+				c.lastConsumeOpts.AutoAck,
+				c.lastConsumeOpts.Exclusive,
+				c.lastConsumeOpts.NoLocal,
+				c.lastConsumeOpts.NoWait,
+				c.lastConsumeOpts.Args,
+			)
+			if err != nil {
+				c.errlog.Printf("Failed to resume consuming: %v", err)
+				continue
+			}
+
+			go func() {
+				for msg := range deliveryStream {
+					select {
+					case c.consumerChan <- msg:
+					case <-c.done:
+						return
+					}
+				}
+				go c.reconnect()
+			}()
+		}
+
 		c.infolog.Println("Reconnected successfully")
 		return
 	}
@@ -215,26 +248,37 @@ func (c *Client) Publish(msg amqp.Publishing, opts PublishOptions) error {
 	)
 }
 
+func (c *Client) SetQos(prefetchCount int) error {
+	if c.channel == nil {
+		return errors.New("channel not initialized")
+	}
+
+	return c.channel.Qos(prefetchCount, 0, false)
+}
+
 type ConsumeOptions struct {
 	Consumer  string
 	AutoAck   bool
 	Exclusive bool
 	NoLocal   bool
 	NoWait    bool
+	Qos       int
 	Args      amqp.Table
 }
 
 func (c *Client) Consume(opts ConsumeOptions) (<-chan amqp.Delivery, error) {
-	if c.conn == nil {
-		return nil, errors.New("no connection available")
+	if c.conn == nil || c.channel == nil || c.conn.IsClosed() || c.channel.IsClosed() {
+		go c.reconnect()
+		return nil, errors.New("connection or channel not available")
 	}
 
-	ch, err := c.conn.AMQPConn.Channel()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create channel: %w", err)
+	if opts.Qos > 0 {
+		if err := c.SetQos(opts.Qos); err != nil {
+			return nil, fmt.Errorf("failed to set QoS: %w", err)
+		}
 	}
 
-	return ch.Consume(
+	deliveries, err := c.channel.Consume(
 		c.queue.Name,
 		opts.Consumer,
 		opts.AutoAck,
@@ -243,4 +287,25 @@ func (c *Client) Consume(opts ConsumeOptions) (<-chan amqp.Delivery, error) {
 		opts.NoWait,
 		opts.Args,
 	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to start consuming: %w", err)
+	}
+
+	c.lastConsumeOpts = &opts
+	if c.consumerChan == nil {
+		c.consumerChan = make(chan amqp.Delivery)
+	}
+
+	go func() {
+		for msg := range deliveries {
+			select {
+			case c.consumerChan <- msg:
+			case <-c.done:
+				return
+			}
+		}
+		go c.reconnect()
+	}()
+
+	return c.consumerChan, nil
 }

@@ -55,6 +55,18 @@ Make sure to run RabbitMQ before testing examples:
 docker run -it --rm --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3.13-management
 ```
 
+Note: If you want to test reconnection logic, you should use something like:
+```bash
+# first time
+docker run -d --name rabbitmq \
+           -p 5672:5672 -p 15672:15672 \
+           -v rabbitmq_data:/var/lib/rabbitmq rabbitmq:3.13-management
+
+# later, instead of Ctrl‑C:
+docker stop rabbitmq          # graceful shutdown
+docker start rabbitmq         # same container
+```
+
 ### Example 1: Minimal setup with `direct` exchange
 
 This example shows the simple setup: a `direct` exchange, a durable queue,
